@@ -2,7 +2,6 @@
 using System;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
-using System.Linq;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
@@ -86,7 +85,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 	public class GhostLimit : Indicator
 	{
-		private const string Version = "1.1";
+		private const string Version = "1.2";
+		// Safety cap inherited from the old Quantity parameter's Range(1,20).
+		private const int MaxQuantity = 20;
 		private const string TagTrigger = "GL_TRIGGER";
 		private const string TagEntry = "GL_ENTRY";
 
@@ -101,8 +102,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private bool isLong;
 		private string errorReason = string.Empty;
 		private bool mouseHooked;
+		private ChartTrader chartTrader;
 
 		private Account accountObj;
+		private string armedAccountName = string.Empty;
+		private string armedTemplate = string.Empty;
+		private int armedQuantity;
 		private Order entryOrder;
 		private double sentPrice;
 		private GhostLimitEntryType sentType;
@@ -110,6 +115,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 		private double lastPrice;
 		private double prevPrice;
+
+		// Snapshot of the Chart Trader selection, taken on the UI thread when Arm is pressed.
+		// The armed order uses ONLY this snapshot: changing the Chart Trader afterwards does
+		// not retarget a live arm (cancel and re-arm to pick up a new selection).
+		private class ArmContext
+		{
+			public Account Account;
+			public string Template;
+			public int Quantity;
+			public string Error;
+		}
 
 		private SharpDX.RectangleF rectLong;
 		private SharpDX.RectangleF rectShort;
@@ -130,10 +146,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				IsSuspendedWhileInactive					= false;
 				BarsRequiredToPlot							= 0;
 
-				AccountName									= "SimBot";
-				AtmTemplate									= "60...40";
 				EntryType									= GhostLimitEntryType.Stop;
-				Quantity									= 2;
 				PlaySoundOnTrigger							= true;
 			}
 			else if (State == State.DataLoaded)
@@ -145,6 +158,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				if (ChartControl != null)
 					ChartControl.Dispatcher.InvokeAsync(() =>
 					{
+						chartTrader = ChartControl.OwnerChart != null ? ChartControl.OwnerChart.ChartTrader : null;
 						ChartControl.PreviewMouseLeftButtonDown += OnChartClick;
 						mouseHooked = true;
 					});
@@ -186,13 +200,19 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					e.Handled = true;
 					if (CanArm())
-						TriggerCustomEvent(o => Arm(true), null);
+					{
+						ArmContext ctx = CaptureChartTraderContext();
+						TriggerCustomEvent(o => Arm(true, ctx), null);
+					}
 				}
 				else if (rectShort.Contains(x, y))
 				{
 					e.Handled = true;
 					if (CanArm())
-						TriggerCustomEvent(o => Arm(false), null);
+					{
+						ArmContext ctx = CaptureChartTraderContext();
+						TriggerCustomEvent(o => Arm(false, ctx), null);
+					}
 				}
 				else if (rectCancel.Contains(x, y))
 				{
@@ -226,10 +246,55 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			Interlocked.CompareExchange(ref armOwner, null, this);
 		}
+
+		// Chart Trader is a WPF control: read it only from the UI thread (mouse handler
+		// and OnRender both run there). The snapshot then travels to the NinjaScript
+		// thread via TriggerCustomEvent.
+		private ArmContext CaptureChartTraderContext()
+		{
+			ArmContext ctx = new ArmContext();
+			try
+			{
+				if (chartTrader == null && ChartControl != null && ChartControl.OwnerChart != null)
+					chartTrader = ChartControl.OwnerChart.ChartTrader;
+				if (chartTrader == null)
+				{
+					ctx.Error = "Chart Trader was not found on this chart.";
+					return ctx;
+				}
+				ctx.Account = chartTrader.Account;
+				AtmStrategy sel = chartTrader.AtmStrategy;
+				if (sel != null)
+					ctx.Template = !string.IsNullOrWhiteSpace(sel.Template) ? sel.Template : sel.DisplayName;
+				ctx.Quantity = chartTrader.Quantity;
+			}
+			catch (Exception ex)
+			{
+				ctx.Error = "Could not read the Chart Trader selection: " + ex.Message;
+			}
+			return ctx;
+		}
+
+		private string DescribeChartTraderSelection()
+		{
+			try
+			{
+				if (chartTrader == null)
+					return "Chart Trader not found";
+				Account a = chartTrader.Account;
+				AtmStrategy sel = chartTrader.AtmStrategy;
+				string atmName = sel == null ? "<None>" : (!string.IsNullOrWhiteSpace(sel.Template) ? sel.Template : sel.DisplayName);
+				return (a == null ? "no account" : a.Name) + " | " + atmName + " | qty " + chartTrader.Quantity;
+			}
+			catch
+			{
+				return "Chart Trader unreadable";
+			}
+		}
 		#endregion
 
 		#region Arm / Cancel
-		private void Arm(bool goLong)
+		private void Arm(bool goLong, ArmContext ctx)
 		{
 			if (!CanArm())
 				return;
@@ -240,17 +305,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 				return;
 			}
 
-			Account a = Account.All.FirstOrDefault(c => c.Name == AccountName);
-			if (a == null)
+			if (ctx == null || ctx.Error != null)
 			{
-				SetError("Account '" + AccountName + "' was not found in NT8.");
+				SetError(ctx == null ? "The Chart Trader selection could not be read." : ctx.Error);
 				return;
 			}
 
-			string templatePath = Path.Combine(Core.Globals.UserDataDir, "templates", "AtmStrategy", AtmTemplate + ".xml");
+			if (ctx.Account == null)
+			{
+				SetError("Chart Trader has no account selected.");
+				return;
+			}
+
+			if (string.IsNullOrWhiteSpace(ctx.Template))
+			{
+				SetError("Chart Trader ATM selector is <None>. Select an ATM template first (GhostLimit needs it for the brackets).");
+				return;
+			}
+
+			string templatePath = Path.Combine(Core.Globals.UserDataDir, "templates", "AtmStrategy", ctx.Template + ".xml");
 			if (!File.Exists(templatePath))
 			{
-				SetError("ATM template '" + AtmTemplate + "' was not found.");
+				SetError("ATM template '" + ctx.Template + "' has no saved .xml (unsaved Custom ATM?). Save it as a template first.");
+				return;
+			}
+
+			if (ctx.Quantity < 1 || ctx.Quantity > MaxQuantity)
+			{
+				SetError("Chart Trader quantity " + ctx.Quantity + " is outside the GhostLimit safety range (1-" + MaxQuantity + ").");
 				return;
 			}
 
@@ -271,7 +353,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 			HorizontalLine le = Draw.HorizontalLine(this, TagEntry, entry, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
 			le.IsLocked = false;
 
-			accountObj = a;
+			accountObj = ctx.Account;
+			armedAccountName = ctx.Account.Name;
+			armedTemplate = ctx.Template;
+			armedQuantity = ctx.Quantity;
 			isLong = goLong;
 			entryOrder = null;
 			prevPrice = RoundTick(refPrice);
@@ -279,8 +364,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			state = GhostLimitState.Armed;
 			armOwner = this;
 
-			Print(string.Format("[GhostLimit] {0} ARMED {1} | account={2} | ATM={3} | type={4} | trigger={5} | entry={6}",
-				DateTime.Now.ToString("HH:mm:ss"), goLong ? "LONG" : "SHORT", AccountName, AtmTemplate, EntryType, trigger, entry));
+			Print(string.Format("[GhostLimit] {0} ARMED {1} | account={2} | ATM={3} | qty={4} | type={5} | trigger={6} | entry={7}",
+				DateTime.Now.ToString("HH:mm:ss"), goLong ? "LONG" : "SHORT", armedAccountName, armedTemplate, armedQuantity, EntryType, trigger, entry));
 			ForceRefresh();
 		}
 
@@ -405,13 +490,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				// NT8 requirement: the entry order's name MUST be "Entry",
 				// otherwise StartAtmStrategy silently never submits the order.
 				entryOrder = accountObj.CreateOrder(Instrument, action, orderType, OrderEntry.Manual, TimeInForce.Day,
-					Quantity, lim, stp, string.Empty, "Entry", Core.Globals.MaxDate, null);
-				AtmStrategy atm = AtmStrategy.StartAtmStrategy(AtmTemplate, entryOrder);
+					armedQuantity, lim, stp, string.Empty, "Entry", Core.Globals.MaxDate, null);
+				AtmStrategy atm = AtmStrategy.StartAtmStrategy(armedTemplate, entryOrder);
 				if (atm == null)
 				{
 					entryOrder = null;
 					RemoveLines();
-					SetError("ATM strategy failed to start (template '" + AtmTemplate + "'). Nothing was sent.");
+					SetError("ATM strategy failed to start (template '" + armedTemplate + "'). Nothing was sent.");
 					return;
 				}
 			}
@@ -432,7 +517,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			Print(string.Format("[GhostLimit] {0} TRIGGERED: touch={1} -> {2} {3} {4} {5} @ {6} | account={7} | ATM={8}",
 				DateTime.Now.ToString("HH:mm:ss"), touchPrice, sentType, isLong ? "BUY" : "SELLSHORT",
-				Quantity, Instrument.MasterInstrument.Name, entry, AccountName, AtmTemplate));
+				armedQuantity, Instrument.MasterInstrument.Name, entry, armedAccountName, armedTemplate));
 			if (PlaySoundOnTrigger)
 				PlaySound(Path.Combine(Core.Globals.InstallDir, "sounds", "Alert2.wav"));
 			ForceRefresh();
@@ -515,13 +600,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 				switch (state)
 				{
 					case GhostLimitState.Armed:
-						text = string.Format("ARMED {0} | {1} | {2} | {3}\nDrag the lines: orange = trigger, blue = entry.",
-							isLong ? "LONG" : "SHORT", AccountName, AtmTemplate, EntryType);
+						text = string.Format("ARMED {0} | {1} | {2} | qty {3} | {4}\nDrag the lines: orange = trigger, blue = entry.",
+							isLong ? "LONG" : "SHORT", armedAccountName, armedTemplate, armedQuantity, EntryType);
 						statusColor = new SharpDX.Color(255, 167, 38, 255);
 						break;
 					case GhostLimitState.Triggered:
 						text = string.Format("TRIGGERED | {0} {1} {2} @ {3} (working, {4})\nMoving the blue line does NOT requote the order.",
-							sentType, isLong ? "BUY" : "SELL", Quantity, sentPrice, AccountName);
+							sentType, isLong ? "BUY" : "SELL", armedQuantity, sentPrice, armedAccountName);
 						statusColor = new SharpDX.Color(66, 165, 245, 255);
 						break;
 					case GhostLimitState.PositionOpen:
@@ -533,7 +618,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						statusColor = new SharpDX.Color(239, 83, 80, 255);
 						break;
 					default:
-						text = "GhostLimit v" + Version + " | DISARMED | use Arm Long / Arm Short.";
+						text = "GhostLimit v" + Version + " | DISARMED | use Arm Long / Arm Short.\nNext order -> " + DescribeChartTraderSelection();
 						statusColor = new SharpDX.Color(158, 158, 158, 255);
 						break;
 				}
@@ -560,20 +645,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 		#endregion
 
 		#region Parameters
-		[Display(Name = "Account", GroupName = "Parameters", Order = 1, Description = "NT8 account the order is sent to.")]
-		public string AccountName { get; set; }
-
-		[Display(Name = "ATM template", GroupName = "Parameters", Order = 2, Description = "Exact ATM template name (without .xml).")]
-		public string AtmTemplate { get; set; }
-
-		[Display(Name = "Entry type", GroupName = "Parameters", Order = 3, Description = "Stop = enter on the comeback (confirmation). Limit = enter on the retest of the line.")]
+		// v1.2: account, ATM template and quantity are no longer parameters — they are
+		// captured from the Chart Trader selection at the moment Arm is pressed.
+		[Display(Name = "Entry type", GroupName = "Parameters", Order = 1, Description = "Stop = enter on the comeback (confirmation). Limit = enter on the retest of the line.")]
 		public GhostLimitEntryType EntryType { get; set; }
 
-		[Range(1, 20)]
-		[Display(Name = "Quantity", GroupName = "Parameters", Order = 4, Description = "Entry contracts; must match the ATM template.")]
-		public int Quantity { get; set; }
-
-		[Display(Name = "Play sound on trigger", GroupName = "Parameters", Order = 5)]
+		[Display(Name = "Play sound on trigger", GroupName = "Parameters", Order = 2)]
 		public bool PlaySoundOnTrigger { get; set; }
 		#endregion
 	}
