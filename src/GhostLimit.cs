@@ -85,7 +85,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 	public class GhostLimit : Indicator
 	{
-		private const string Version = "1.2";
+		private const string Version = "1.2.1";
 		// Safety cap inherited from the old Quantity parameter's Range(1,20).
 		private const int MaxQuantity = 20;
 		private const string TagTrigger = "GL_TRIGGER";
@@ -614,7 +614,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 						statusColor = new SharpDX.Color(102, 187, 106, 255);
 						break;
 					case GhostLimitState.Error:
-						text = "ERROR: " + errorReason;
+						// The error sticks until the next Arm/Cancel; show the live selection
+						// underneath so a fixed Chart Trader is visibly ready to re-arm.
+						text = "ERROR: " + errorReason + "\nNext order -> " + DescribeChartTraderSelection() + " | press Arm to retry.";
 						statusColor = new SharpDX.Color(239, 83, 80, 255);
 						break;
 					default:
