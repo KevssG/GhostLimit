@@ -64,8 +64,47 @@ internal static class GhostLimitTests
 		Placement();
 
 		Console.WriteLine();
+		Console.WriteLine("v1.2.4 · la linea de entrada se borra al quedar plana la posicion (10 casos)");
+		Lifecycle();
+
+		Console.WriteLine();
 		Console.WriteLine(string.Format("=== {0} passed, {1} failed ===", passed, failed));
 		return failed == 0 ? 0 : 1;
+	}
+
+	// Ciclo de vida de la linea azul tras el fill. La regla es la que corre en cada tick
+	// con POSITION OPEN; aqui se le dan las lecturas que veria en el chart.
+	private static void Lifecycle()
+	{
+		double grace = GhostLimitRules.FlatGraceSeconds;
+
+		// Lo que Kevin usa: armada sin ejecutar, la cuenta esta plana porque NO hay orden
+		// en el mercado. La linea tiene que quedarse pase el tiempo que pase.
+		Clear(GhostLimitState.Armed, false, true, 0.0, false, "ARMED sin ejecutar, cuenta plana -> la linea se queda");
+		Clear(GhostLimitState.Armed, false, true, 3600.0, false, "ARMED una hora sin tocar el gatillo -> la linea se queda");
+		// Disparada y trabajando en el broker: sigue sin posicion, la linea se queda.
+		Clear(GhostLimitState.Triggered, false, true, 60.0, false, "TRIGGERED trabajando, cuenta plana -> la linea se queda");
+		// Sin orden viva no hay nada que borrar por este camino.
+		Clear(GhostLimitState.Disarmed, true, true, 60.0, false, "DISARMED -> no aplica");
+		Clear(GhostLimitState.Error, true, true, 60.0, false, "ERROR -> no aplica");
+
+		// Entrada ejecutada, posicion vista abierta, luego plana: TP, SL o Flatten manual
+		// se ven identicos desde la cuenta. Se borra sin esperar gracia.
+		Clear(GhostLimitState.PositionOpen, true, true, 0.5, true, "ejecutada, posicion vista, vuelve plana -> se borra (TP/SL/Flatten)");
+		// Posicion todavia abierta: la linea se queda mientras el ATM gestiona.
+		Clear(GhostLimitState.PositionOpen, true, false, 600.0, false, "ejecutada, posicion sigue abierta -> la linea se queda");
+		// Recien llenada y la cuenta aun no refleja la posicion: NO borrar (falso plano).
+		Clear(GhostLimitState.PositionOpen, false, true, grace - 1.0, false, "recien llenada, cuenta aun plana dentro de la gracia -> no borra");
+		// Entrada y stop entre dos ticks: nunca se vio la posicion, pero pasada la gracia
+		// plana es plana.
+		Clear(GhostLimitState.PositionOpen, false, true, grace, true, "nunca se vio la posicion, plana pasada la gracia -> se borra");
+		Clear(GhostLimitState.PositionOpen, false, true, grace + 30.0, true, "nunca se vio la posicion, plana mucho despues -> se borra");
+	}
+
+	private static void Clear(GhostLimitState state, bool sawPosition, bool isFlatNow, double secondsSinceFill, bool expected, string caso)
+	{
+		bool actual = GhostLimitRules.ShouldClearAfterClose(state, sawPosition, isFlatNow, secondsSinceFill, GhostLimitRules.FlatGraceSeconds);
+		Report(actual == expected, caso, expected ? "borra" : "se queda", actual ? "borra" : "se queda");
 	}
 
 	private static void Placement()

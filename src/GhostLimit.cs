@@ -81,11 +81,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 			return null;
 		}
+
+		// v1.2.4 — gracia entre el fill y la primera lectura fiable de la posición. La
+		// ejecución y la actualización de Account.Positions no son atómicas: justo después
+		// del fill la cuenta puede leerse "plana" un instante sin que la posición haya
+		// cerrado. Pasada la gracia, plana es plana (p. ej. entrada y stop entre dos ticks).
+		public const double FlatGraceSeconds = 10.0;
+
+		// v1.2.4 — única regla que decide si se borra la línea de entrada por cierre de la
+		// posición. Solo aplica con POSITION OPEN: una orden ARMADA (aún sin ejecutar) o
+		// TRIGGERED (trabajando en el broker) conserva sus líneas aunque la cuenta esté
+		// plana, porque plana es justamente su estado normal. Un cierre por TP, por SL o
+		// por Flatten manual se ve igual desde aquí: la cuenta vuelve a plana.
+		//   sawPosition       la posición se leyó distinta de plana en algún momento tras el fill
+		//   isFlatNow         lectura actual de la cuenta para el instrumento del chart
+		//   secondsSinceFill  segundos desde que la entrada se reportó FILLED
+		public static bool ShouldClearAfterClose(GhostLimitState state, bool sawPosition, bool isFlatNow, double secondsSinceFill, double graceSeconds)
+		{
+			if (state != GhostLimitState.PositionOpen)
+				return false;
+			if (!isFlatNow)
+				return false;
+			return sawPosition || secondsSinceFill >= graceSeconds;
+		}
 	}
 
 	public class GhostLimit : Indicator
 	{
-		private const string Version = "1.2.1";
+		private const string Version = "1.2.4";
 		// Safety cap inherited from the old Quantity parameter's Range(1,20).
 		private const int MaxQuantity = 20;
 		private const string TagTrigger = "GL_TRIGGER";
@@ -98,10 +121,45 @@ namespace NinjaTrader.NinjaScript.Indicators
 		// la posesión se recupera sola si quien la tiene ya no está armado ni disparado.
 		private static GhostLimit armOwner;
 
+		// v1.2.2 — dueño del clic por chart. Al recargar la serie (F5 / Reload NinjaScript /
+		// cambio de timeframe) NT8 crea la instancia nueva y termina la vieja DESPUÉS; si en
+		// ese Terminated `ChartControl` ya es null, el handler de la vieja se queda enganchado
+		// al chart. Como se suscribió antes, corre primero, pone e.Handled = true y su
+		// TriggerCustomEvent ya no ejecuta nada (la instancia está terminada): el clic muere
+		// ahí y la instancia viva —la que pinta el banner— nunca lo ve. Eso es el "botón mudo".
+		// Regla: la ÚLTIMA instancia que se enganchó a un ChartControl es la dueña de sus
+		// clics; cualquier otra deja pasar el evento sin tocarlo. Solo se lee/escribe en el
+		// hilo de UI (hook, Terminated y handler corren ahí), por eso no lleva lock.
+		private static readonly System.Collections.Generic.Dictionary<ChartControl, GhostLimit> clickOwner
+			= new System.Collections.Generic.Dictionary<ChartControl, GhostLimit>();
+
+		// Sello corto por instancia para distinguir en Output la viva de la fantasma.
+		private readonly string instanceId = Guid.NewGuid().ToString("N").Substring(0, 4);
+
+		// v1.2.3 — diagnóstico a FICHERO además de Output. La ventana Output no persiste y
+		// no se puede leer desde fuera de NT8; el fichero sí. Todo en try/catch: el
+		// diagnóstico nunca puede romper lo que diagnostica.
+		private static readonly string DiagPath = Path.Combine(Core.Globals.UserDataDir, "GhostLimit_diag.log");
+
+		private void Diag(string msg)
+		{
+			string line = "[GhostLimit#" + instanceId + "] " + DateTime.Now.ToString("HH:mm:ss.fff") + " " + msg;
+			try { Print(line); } catch { }
+			try { File.AppendAllText(DiagPath, DateTime.Now.ToString("yyyy-MM-dd ") + line + Environment.NewLine); } catch { }
+		}
+
+		private void DiagEx(string where, Exception ex)
+		{
+			Diag("EXCEPTION in " + where + ": " + ex.GetType().Name + ": " + ex.Message + Environment.NewLine + ex.ToString());
+		}
+
 		private GhostLimitState state = GhostLimitState.Disarmed;
 		private bool isLong;
 		private string errorReason = string.Empty;
 		private bool mouseHooked;
+		// Referencia capturada al enganchar: el desenganche en Terminated usa ESTA, no la
+		// propiedad ChartControl, que en Terminated puede venir null y dejar el handler vivo.
+		private ChartControl hookedChart;
 		private ChartTrader chartTrader;
 
 		private Account accountObj;
@@ -112,6 +170,11 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double sentPrice;
 		private GhostLimitEntryType sentType;
 		private DateTime triggeredAt;
+		// v1.2.4 — ciclo de vida tras el fill: cuándo se llenó y si ya se vio la posición
+		// abierta en la cuenta (ver GhostLimitRules.ShouldClearAfterClose).
+		private DateTime filledAt;
+		private bool sawPosition;
+		private bool flatReadErrorLogged;
 
 		private double lastPrice;
 		private double prevPrice;
@@ -153,24 +216,47 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				RemoveDrawObject(TagTrigger);
 				RemoveDrawObject(TagEntry);
-				Print("[GhostLimit] v" + Version + " loaded on " + Instrument.FullName);
+				Diag("v" + Version + " loaded on " + Instrument.FullName + " | ChartControl=" + (ChartControl == null ? "null" : "ok"));
 
-				if (ChartControl != null)
-					ChartControl.Dispatcher.InvokeAsync(() =>
+				ChartControl cc = ChartControl;
+				if (cc != null)
+					cc.Dispatcher.InvokeAsync(() =>
 					{
-						chartTrader = ChartControl.OwnerChart != null ? ChartControl.OwnerChart.ChartTrader : null;
-						ChartControl.PreviewMouseLeftButtonDown += OnChartClick;
-						mouseHooked = true;
+						try
+						{
+							// Si NT8 nos terminó antes de que corriera este InvokeAsync, no engancharse:
+							// sería un handler fantasma desde el primer segundo.
+							if (State == State.Terminated)
+							{
+								Diag("hook skipped: instance already terminated");
+								return;
+							}
+							chartTrader = cc.OwnerChart != null ? cc.OwnerChart.ChartTrader : null;
+							cc.PreviewMouseLeftButtonDown += OnChartClick;
+							hookedChart = cc;
+							mouseHooked = true;
+							clickOwner[cc] = this;
+							Diag("click handler hooked | chartTrader=" + (chartTrader == null ? "null" : "ok") + " | " + DescribeChartTraderSelection());
+						}
+						catch (Exception ex)
+						{
+							DiagEx("hook", ex);
+						}
 					});
 			}
 			else if (State == State.Terminated)
 			{
 				ReleaseArmOwnership();
-				if (mouseHooked && ChartControl != null)
-					ChartControl.Dispatcher.InvokeAsync(() =>
+				ChartControl cc = hookedChart;
+				if (cc != null)
+					cc.Dispatcher.InvokeAsync(() =>
 					{
-						ChartControl.PreviewMouseLeftButtonDown -= OnChartClick;
+						cc.PreviewMouseLeftButtonDown -= OnChartClick;
 						mouseHooked = false;
+						hookedChart = null;
+						GhostLimit owner;
+						if (clickOwner.TryGetValue(cc, out owner) && ReferenceEquals(owner, this))
+							clickOwner.Remove(cc);
 					});
 			}
 		}
@@ -196,35 +282,69 @@ namespace NinjaTrader.NinjaScript.Indicators
 				float x = (float)(p.X * scaleX);
 				float y = (float)(p.Y * scaleY);
 
-				if (rectLong.Contains(x, y))
+				string button = rectLong.Contains(x, y) ? "Arm Long"
+					: rectShort.Contains(x, y) ? "Arm Short"
+					: rectCancel.Contains(x, y) ? "Cancel"
+					: null;
+
+				// Todo clic sobre el chart deja rastro con su geometría: si un botón "no hace
+				// nada" hay que poder ver si el clic llegó y dónde cayó respecto a los botones.
+				Diag(string.Format("click at ({0:0},{1:0}) scale={2:0.##} State={3} state={4} -> {5} | long={6} short={7} cancel={8} | src={9}",
+					x, y, scaleX, State, state, button ?? "(no button)",
+					RectStr(rectLong), RectStr(rectShort), RectStr(rectCancel),
+					e.OriginalSource == null ? "null" : e.OriginalSource.GetType().Name));
+
+				if (button == null)
+					return;
+
+				// Instancia fantasma (terminada, o desplazada por una recarga): deja pasar el
+				// evento SIN marcarlo Handled para que lo reciba la instancia dueña del chart.
+				GhostLimit owner = null;
+				ChartControl cc = hookedChart;
+				bool isOwner = cc != null && clickOwner.TryGetValue(cc, out owner) && ReferenceEquals(owner, this);
+				if (State == State.Terminated || !isOwner)
 				{
-					e.Handled = true;
-					if (CanArm())
-					{
-						ArmContext ctx = CaptureChartTraderContext();
-						TriggerCustomEvent(o => Arm(true, ctx), null);
-					}
+					Diag(string.Format("click on '{0}' passed on: this instance is {1} (stale handler after a chart reload).",
+						button, State == State.Terminated ? "terminated" : "not the chart's click owner"));
+					return;
 				}
-				else if (rectShort.Contains(x, y))
+
+				e.Handled = true;
+				Diag(string.Format("click '{0}' | state={1} | CanArm={2}", button, state, CanArm()));
+
+				if (button == "Cancel")
 				{
-					e.Handled = true;
-					if (CanArm())
-					{
-						ArmContext ctx = CaptureChartTraderContext();
-						TriggerCustomEvent(o => Arm(false, ctx), null);
-					}
-				}
-				else if (rectCancel.Contains(x, y))
-				{
-					e.Handled = true;
 					if (state == GhostLimitState.Armed || state == GhostLimitState.Triggered)
-						TriggerCustomEvent(o => CancelPressed(), null);
+						TriggerCustomEvent(o => { try { CancelPressed(); } catch (Exception ex) { DiagEx("CancelPressed", ex); } }, null);
+				}
+				else if (CanArm())
+				{
+					bool goLong = button == "Arm Long";
+					ArmContext ctx = CaptureChartTraderContext();
+					Diag("ctx captured | account=" + (ctx.Account == null ? "null" : ctx.Account.Name) + " | template=" + (ctx.Template ?? "null") + " | qty=" + ctx.Quantity + " | err=" + (ctx.Error ?? "none"));
+					bool ran = false;
+					TriggerCustomEvent(o =>
+					{
+						ran = true;
+						try { Arm(goLong, ctx); }
+						catch (Exception ex)
+						{
+							DiagEx("Arm", ex);
+							try { SetError("Arm failed: " + ex.GetType().Name + ": " + ex.Message); } catch (Exception ex2) { DiagEx("SetError", ex2); }
+						}
+					}, null);
+					Diag("TriggerCustomEvent returned | callback ran=" + ran + " | state now=" + state);
 				}
 			}
 			catch (Exception ex)
 			{
-				Print("[GhostLimit] Click handler exception: " + ex.Message);
+				DiagEx("OnChartClick", ex);
 			}
+		}
+
+		private static string RectStr(SharpDX.RectangleF r)
+		{
+			return string.Format("[{0:0},{1:0} {2:0}x{3:0}]", r.X, r.Y, r.Width, r.Height);
 		}
 
 		private bool CanArm()
@@ -347,11 +467,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 			GhostLimitRules.DefaultLines(refPrice, goLong, GhostLimitRules.DefaultSeparationPoints, out trigger, out entry);
 			trigger = RoundTick(trigger);
 			entry = RoundTick(entry);
+			Diag("Arm: checks passed, drawing lines trigger=" + trigger + " entry=" + entry);
 
 			HorizontalLine lt = Draw.HorizontalLine(this, TagTrigger, trigger, Brushes.DarkOrange, DashStyleHelper.Dash, 2);
 			lt.IsLocked = false;
 			HorizontalLine le = Draw.HorizontalLine(this, TagEntry, entry, Brushes.DodgerBlue, DashStyleHelper.Solid, 2);
 			le.IsLocked = false;
+			Diag("Arm: lines drawn");
 
 			accountObj = ctx.Account;
 			armedAccountName = ctx.Account.Name;
@@ -364,8 +486,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 			state = GhostLimitState.Armed;
 			armOwner = this;
 
-			Print(string.Format("[GhostLimit] {0} ARMED {1} | account={2} | ATM={3} | qty={4} | type={5} | trigger={6} | entry={7}",
-				DateTime.Now.ToString("HH:mm:ss"), goLong ? "LONG" : "SHORT", armedAccountName, armedTemplate, armedQuantity, EntryType, trigger, entry));
+			Diag(string.Format("ARMED {0} | account={1} | ATM={2} | qty={3} | type={4} | trigger={5} | entry={6}",
+				goLong ? "LONG" : "SHORT", armedAccountName, armedTemplate, armedQuantity, EntryType, trigger, entry));
 			ForceRefresh();
 		}
 
@@ -412,7 +534,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		{
 			state = GhostLimitState.Error;
 			errorReason = reason;
-			Print("[GhostLimit] " + DateTime.Now.ToString("HH:mm:ss") + " ERROR: " + reason);
+			Diag("ERROR: " + reason);
 			if (PlaySoundOnTrigger)
 				PlaySound(Path.Combine(Core.Globals.InstallDir, "sounds", "Alert4.wav"));
 			ForceRefresh();
@@ -443,6 +565,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 				WatchTouch(p);
 			else if (state == GhostLimitState.Triggered)
 				WatchOrder();
+			else if (state == GhostLimitState.PositionOpen)
+				WatchPosition();
 
 			prevPrice = p;
 		}
@@ -544,6 +668,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (entryOrder.OrderState == OrderState.Filled)
 			{
+				filledAt = DateTime.Now;
+				sawPosition = false;
+				flatReadErrorLogged = false;
 				state = GhostLimitState.PositionOpen;
 				Print("[GhostLimit] " + DateTime.Now.ToString("HH:mm:ss") + " entry FILLED @ " + entryOrder.AverageFillPrice + "; ATM is managing the position.");
 				ForceRefresh();
@@ -561,6 +688,70 @@ namespace NinjaTrader.NinjaScript.Indicators
 				entryOrder = null;
 				RemoveLines();
 				SetError("Entry order was REJECTED by the broker/sim (see NT8 Log).");
+			}
+		}
+
+		// v1.2.4 — con POSITION OPEN se vigila la posición de la cuenta armada para el
+		// instrumento del chart, con el mismo mecanismo con el que se vigila el fill: en
+		// cada tick, sin suscribirse a eventos de la cuenta (nada que desenganchar en
+		// Terminated). Cuando vuelve a plana —TP, SL o Flatten manual, da igual— se borra
+		// la línea azul de entrada (el gatillo ya se borró al disparar) y el indicador
+		// queda DISARMED. Hasta ahora nadie borraba esa línea: quedaba como dibujo muerto.
+		private void WatchPosition()
+		{
+			bool? flat = AccountIsFlat();
+			if (flat == null)
+				return; // lectura no fiable: nunca borrar por no poder mirar.
+
+			if (!flat.Value)
+			{
+				sawPosition = true;
+				return;
+			}
+
+			double sinceFill = (DateTime.Now - filledAt).TotalSeconds;
+			if (!GhostLimitRules.ShouldClearAfterClose(state, sawPosition, true, sinceFill, GhostLimitRules.FlatGraceSeconds))
+				return;
+
+			entryOrder = null;
+			RemoveLines();
+			state = GhostLimitState.Disarmed;
+			Print("[GhostLimit] " + DateTime.Now.ToString("HH:mm:ss") + " position on " + Instrument.FullName + " is FLAT (" + armedAccountName + "); entry line removed, disarmed.");
+			Diag("position flat after fill | sawPosition=" + sawPosition + " | " + sinceFill.ToString("0.0") + "s since fill -> lines removed, DISARMED");
+			ForceRefresh();
+		}
+
+		// true = la cuenta armada no tiene posición en el instrumento del chart;
+		// false = la tiene; null = no se pudo leer (la colección cambió debajo, cuenta nula).
+		// Solo mira la cuenta capturada al armar (R14): ninguna otra cuenta entra aquí.
+		private bool? AccountIsFlat()
+		{
+			try
+			{
+				if (accountObj == null || Instrument == null)
+					return null;
+				string name = Instrument.FullName;
+				foreach (Position pos in accountObj.Positions)
+				{
+					if (pos == null || pos.Instrument == null)
+						continue;
+					if (!string.Equals(pos.Instrument.FullName, name, StringComparison.OrdinalIgnoreCase))
+						continue;
+					if (pos.MarketPosition != MarketPosition.Flat && pos.Quantity != 0)
+						return false;
+				}
+				return true;
+			}
+			catch (Exception ex)
+			{
+				// Una sola línea por ciclo: esto corre en cada tick y un fallo persistente
+				// inundaría el fichero de diagnóstico.
+				if (!flatReadErrorLogged)
+				{
+					flatReadErrorLogged = true;
+					DiagEx("AccountIsFlat", ex);
+				}
+				return null;
 			}
 		}
 		#endregion
@@ -610,7 +801,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 						statusColor = new SharpDX.Color(66, 165, 245, 255);
 						break;
 					case GhostLimitState.PositionOpen:
-						text = "POSITION OPEN | managed by ATM/Chart Trader. Arm again for a new order.";
+						text = "POSITION OPEN | managed by ATM/Chart Trader. Entry line clears when flat. Arm again for a new order.";
 						statusColor = new SharpDX.Color(102, 187, 106, 255);
 						break;
 					case GhostLimitState.Error:

@@ -26,7 +26,7 @@ until the tap, and then it goes in as a stop entry on the pullback.
 | **Entry type** | `Stop` (default) or `Limit` |
 | **Account · ATM · quantity** (v1.2) | whatever is selected in **Chart Trader** at the moment you press Arm — snapshotted, so changing Chart Trader afterwards never retargets a live arm |
 | **Brackets** | always a native NT8 ATM template — no hand-rolled OCO |
-| **Lifecycle** | one shot per arm: `DISARMED → ARMED → TRIGGERED → POSITION OPEN` |
+| **Lifecycle** | one shot per arm: `DISARMED → ARMED → TRIGGERED → POSITION OPEN → DISARMED` — *(v1.2.4)* once the position goes flat (TP, SL or Flatten) both lines are removed and the indicator disarms itself |
 
 Both lines are draggable. On load they appear 50 points apart, 25 either side of price, so
 there is room to place them before arming.
@@ -68,10 +68,18 @@ can be tested with the market closed and NinjaTrader shut:
 powershell -File tests\correr_pruebas_ghostlimit.ps1
 ```
 
-26 cases (full truth table for the marketable/invalid guard, touch detection across gaps,
-and initial line placement). Exit `0` green, `1` a failing test, `2` a compile error.
+36 cases (full truth table for the marketable/invalid guard, touch detection across gaps,
+initial line placement, and the post-fill lifecycle: when the entry line is cleared and when
+it must stay). Exit `0` green, `1` a failing test, `2` a compile error.
 `tools\compilar_ninjascript.ps1` compile-checks any NinjaScript file against the real
 NinjaTrader DLLs.
+
+## Diagnostics
+
+*(v1.2.3)* Besides the Output window, every state change, click and exception is appended to
+`Documents\NinjaTrader 8\GhostLimit_diag.log`, which — unlike Output — survives a restart and
+can be read from outside NinjaTrader. Each line carries a short instance id, so a stale
+instance left over from a reload is easy to tell apart from the live one.
 
 ## Two gotchas that cost me hours
 
@@ -80,14 +88,18 @@ NinjaTrader DLLs.
   shows on the chart as an uncancellable working order, and never reaches the simulator.
 - **Recompiling does not reload the instance on your chart.** The old instance stays alive and
   can still fire with the previous binary. Disarm before pressing F5, and check the version
-  stamp afterwards.
+  stamp afterwards. *(v1.2.2)* A stale instance can no longer swallow the chart's clicks: only
+  the instance that hooked the chart last owns its buttons.
 
 ## Known limitations (v1)
 
 State advances on the next incoming tick (polled in `OnMarketData`); removing the indicator
 while an order is working does *not* cancel it (it stays as a manual order with its ATM);
 dragging the entry line after the trigger does not re-quote; an armed state does not survive
-a NinjaTrader restart — by design.
+a NinjaTrader restart — by design. *(v1.2.4)* The entry line is cleared when the account's
+position in that instrument goes flat, so if you already held a position there before the
+ghost order filled, the line stays until *everything* is flat; the check runs on each tick,
+so with no ticks the line clears on the next one.
 
 ## License
 
@@ -114,7 +126,8 @@ línea de entrada (azul) = donde se coloca de verdad. `Stop` (default) o `Limit`
 plantilla ATM y cantidad (v1.2): las que estén seleccionadas en el Chart Trader al pulsar
 Arm** — se capturan como snapshot, así que cambiar el Chart Trader después nunca redirige un
 armado vivo. Brackets siempre por ATM nativo. Un disparo por armado:
-`DISARMED → ARMED → TRIGGERED → POSITION OPEN`. Las dos líneas son arrastrables y nacen a 50
+`DISARMED → ARMED → TRIGGERED → POSITION OPEN → DISARMED` — *(v1.2.4)* al quedar plana la
+posición (TP, SL o Flatten) se borran las dos líneas y el indicador se desarma solo. Las dos líneas son arrastrables y nacen a 50
 puntos de distancia, 25 a cada lado del precio.
 
 **Fail-closed.** Si al momento del disparo la orden sería inválida o marketable, no se envía
@@ -131,16 +144,20 @@ guardar) o la cantidad sale de 1–20. Los únicos parámetros del indicador son
 `PlaySoundOnTrigger`. El nombre de la plantilla ATM debe coincidir con el archivo en
 `templates\AtmStrategy\` (los `...` son literales).
 
-**Pruebas.** `powershell -File tests\correr_pruebas_ghostlimit.ps1` corre 26 casos con el
+**Pruebas.** `powershell -File tests\correr_pruebas_ghostlimit.ps1` corre 36 casos con el
 mercado cerrado y NinjaTrader apagado (las reglas puras viven en `GhostLimitRules`).
 
 **Dos trampas que costaron horas.** El `name` de la orden debe ser exactamente `"Entry"` o
 `StartAtmStrategy` falla en silencio y la orden queda `Initialized` para siempre. Y recompilar
-**no** recarga la instancia de tu gráfica: desarma antes del F5 y verifica el sello de versión.
+**no** recarga la instancia de tu gráfica: desarma antes del F5 y verifica el sello de versión. *(v1.2.2)* Una instancia vieja ya no se traga los clics: solo la
+última que se enganchó a la gráfica es dueña de sus botones. *(v1.2.3)* Todo cambio de estado,
+clic y excepción queda también en `Documents\NinjaTrader 8\GhostLimit_diag.log`.
 
 **Limitaciones v1.** El estado avanza con el siguiente tick; quitar el indicador con una orden
 viva no la cancela; arrastrar la línea azul después del disparo no re-cotiza; el armado no
-sobrevive a un reinicio de NinjaTrader (a propósito).
+sobrevive a un reinicio de NinjaTrader (a propósito). *(v1.2.4)* La línea azul se borra cuando
+la posición de la cuenta en ese instrumento queda plana: si ya tenías posición antes del fill,
+se queda hasta que todo quede plano.
 
 Licencia MIT. Software de trading tal cual, sin garantía: manda órdenes reales y tú eres
 responsable de todas. Esto no es asesoría financiera.
